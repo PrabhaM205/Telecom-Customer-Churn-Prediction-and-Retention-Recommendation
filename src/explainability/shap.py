@@ -367,55 +367,19 @@ if __name__ == "__main__":
     print("Loading raw customer data...")
     df_raw = load_raw_data()
 
-    # --- Interactive: look up ONE customer first, before the bulk report ---
-    customer_id_input = input(
-        "\nEnter a Customer ID to see their individual churn reason + "
-        "retention strategy (press Enter to skip): "
-    ).strip()
-    if customer_id_input:
+    # Individual customer lookup only -- loops so you can check several
+    # customers in one run. Press Enter with no ID to exit.
+    while True:
+        customer_id_input = input(
+            "\nEnter a Customer ID to see their individual churn reason + "
+            "retention strategy (press Enter to skip): "
+        ).strip()
+
+        if not customer_id_input:
+            print("No Customer ID entered. Exiting.")
+            break
+
         single_explanation = explain_single_customer(customer_id_input, model, explainer, df_raw)
         if single_explanation:
             print_customer_report(single_explanation)
             print(f"Waterfall plot saved to: {single_explanation['waterfall_plot_path']}\n")
-
-    print("Preparing full customer feature matrix...")
-    X_transformed, feature_names, df_engineered = prepare_features(df_raw)
-    print(f"Prepared feature matrix: {X_transformed.shape}")
-
-    print("Computing SHAP values (this can take a minute on the full dataset)...")
-    shap_explanation = compute_shap_values(explainer, X_transformed)
-
-    # Sanity check on row 0
-    check = verify_shap_consistency(model, shap_explanation, X_transformed, row_index=0)
-    print(f"\nConsistency check (row 0): {check}")
-
-    # --- Global importance ---
-    importance = global_feature_importance(shap_explanation, feature_names, top_n=20)
-    importance_path = os.path.join(REPORTS_DIR, "shap_global_importance.csv")
-    importance.to_csv(importance_path, index=False)
-    print(f"\nTop 20 global feature importances saved to: {importance_path}")
-    print(importance.to_string(index=False))
-
-    # --- Global summary plot ---
-    summary_plot_path = plot_global_summary(shap_explanation, X_transformed, feature_names)
-    print(f"\nSHAP summary plot saved to: {summary_plot_path}")
-
-    # --- Local explanations for the 5 highest-risk customers ---
-    probabilities = model.predict_proba(X_transformed)[:, 1]
-    top_risk_idx = np.argsort(probabilities)[::-1][:5]
-
-    local_explanations = []
-    for idx in top_risk_idx:
-        customer_id = df_engineered.iloc[idx].get("CustomerID", f"row_{idx}")
-        explanation = explain_customer(shap_explanation, idx, feature_names, customer_id=customer_id)
-        local_explanations.append(explanation)
-        plot_customer_waterfall(shap_explanation, idx, customer_id)
-
-    local_path = os.path.join(REPORTS_DIR, "shap_top5_risk_explanations.json")
-    with open(local_path, "w") as f:
-        json.dump(local_explanations, f, indent=2)
-    print(f"\nTop 5 highest-risk customer explanations saved to: {local_path}")
-    for exp in local_explanations:
-        print(f"\nCustomer {exp['customer_id']} -- churn probability {exp['predicted_churn_probability']:.2%}")
-        print("  Top risk drivers:", [d["feature"] for d in exp["top_risk_drivers"][:3]])
-        print("  Top retention drivers:", [d["feature"] for d in exp["top_retention_drivers"][:3]])
