@@ -1,0 +1,13 @@
+{
+    "model": "XGBoost",
+    "threshold": 0.55,
+    "accuracy": 0.7693,
+    "precision": 0.547,
+    "recall": 0.762,
+    "f1_score": 0.6369,
+    "roc_auc": 0.8557,
+    "scale_pos_weight": 2.7686,
+    "n_train_samples": 5634,
+    "n_test_samples": 1409,
+    "n_features": 48
+}
