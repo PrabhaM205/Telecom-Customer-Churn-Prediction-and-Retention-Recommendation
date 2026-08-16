@@ -78,7 +78,13 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # --- 6. Sanity assertions — fail loudly if a future data refresh breaks these ---
     assert df["Total Charges"].isna().sum() == 0, "Unresolved nulls in Total Charges"
-    assert df["Churn Value"].isin([0, 1]).all(), "Churn Value must be binary"
+    # Churn Value only exists at TRAINING time (it's the label). At inference
+    # time, predictor.py calls clean_data() on a new customer we're trying
+    # to predict FOR — so this column legitimately won't exist. Only
+    # validate it when present, so this function works correctly in both
+    # training and live-prediction contexts.
+    if "Churn Value" in df.columns:
+        assert df["Churn Value"].isin([0, 1]).all(), "Churn Value must be binary"
     assert df["Tenure Months"].ge(0).all(), "Negative tenure found"
 
     return df.reset_index(drop=True)
