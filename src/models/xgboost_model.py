@@ -22,7 +22,7 @@ from src.preprocessing.pipeline import (
     fit_and_save,
     load_transform
 )
-
+from src.config import get
 
 # ============================================================
 # Paths
@@ -56,7 +56,7 @@ METRICS_PATH = os.path.join(
 # Decision Threshold
 # ============================================================
 
-THRESHOLD = 0.55
+THRESHOLD = get("model", "xgboost", "decision_threshold", default=0.55)
 
 
 # ============================================================
