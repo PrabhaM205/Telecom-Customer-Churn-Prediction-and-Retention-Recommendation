@@ -2,6 +2,7 @@ import os
 
 from dotenv import load_dotenv
 from google import genai
+from src.config import get
 
 
 # ============================================================
@@ -41,7 +42,7 @@ client = genai.Client(
 # GEMINI FLASH MODEL
 # ============================================================
 
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = get("llm", "model_name", default="gemini-3.6-flash")
 
 
 # ============================================================
