@@ -15,11 +15,12 @@ Features:
 - Offers trend
 - Recommendations
 - Accept / Dismiss recommendations
-- CSV export of filtered customers
+- CSV export
 - Model metrics
 - SHAP global importance
 - AI Retention Assistant
 - RAG + LLM retention offer generation
+- Continuous Gmail complaint polling
 
 Run:
 
@@ -29,6 +30,7 @@ Run:
 import json
 import math
 import re
+
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -40,7 +42,16 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from genai.offer_generator import generate_retention_offer
+from src.complaints.complaint_handler import (
+    COMPLAINTS_PATH,
+    _load_json_store,
+    start_email_polling_background,
+    stop_email_polling,
+)
+
+from genai.offer_generator import (
+    generate_retention_offer,
+)
 
 from api.schemas import (
     ChatRequest,
@@ -62,11 +73,13 @@ from api.schemas import (
 )
 
 
-# ============================================================================
+# ============================================================
 # PATHS
-# ============================================================================
+# ============================================================
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = (
+    Path(__file__).resolve().parent.parent
+)
 
 RISK_SCORES_CSV = (
     PROJECT_ROOT
@@ -96,9 +109,9 @@ SHAP_GLOBAL_CSV = (
 )
 
 
-# ============================================================================
+# ============================================================
 # FASTAPI APP
-# ============================================================================
+# ============================================================
 
 app = FastAPI(
     title="Churn Retention API",
@@ -106,38 +119,81 @@ app = FastAPI(
 )
 
 
+# ============================================================
+# CORS
+# ============================================================
+
 app.add_middleware(
     CORSMiddleware,
+
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        
     ],
+
     allow_credentials=True,
+
     allow_methods=["*"],
+
     allow_headers=["*"],
 )
 
 
-# ============================================================================
-# HEALTH CHECK
-# ============================================================================
+# ============================================================
+# STARTUP / SHUTDOWN
+# ============================================================
+
+@app.on_event("startup")
+def startup_event():
+
+    print("\n" + "=" * 60)
+
+    print(
+        "FASTAPI BACKEND STARTED"
+    )
+
+    print(
+        "Starting complaint email monitoring..."
+    )
+
+    print("=" * 60 + "\n")
+
+    start_email_polling_background()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+
+    print(
+        "\n[main] "
+        "FastAPI shutting down..."
+    )
+
+    stop_email_polling()
+
+    print(
+        "[main] "
+        "Complaint polling stopped."
+    )
+
+
+# ============================================================
+# HEALTH
+# ============================================================
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok"
     }
 
 
-# ============================================================================
+# ============================================================
 # HELPERS
-# ============================================================================
+# ============================================================
 
 def _clean_nan(value):
-    """
-    Convert Pandas NaN values to None.
-    """
 
     if value is None:
         return None
@@ -152,49 +208,48 @@ def _risk_tier_from_string(
     raw: str,
     fallback_probability: float = 0.0,
 ) -> RiskTier:
-    """
-    Convert risk tier to API enum.
-
-    Accepted:
-        high
-        medium
-        low
-
-    If invalid/missing, derive from churn probability.
-    """
 
     if raw:
-        normalized = str(raw).strip().lower()
+
+        normalized = (
+            str(raw)
+            .strip()
+            .lower()
+        )
 
         if normalized in (
             "high",
             "medium",
             "low",
         ):
-            return RiskTier(normalized)
+
+            return RiskTier(
+                normalized
+            )
 
     if fallback_probability >= 0.66:
+
         return RiskTier.HIGH
 
     if fallback_probability >= 0.33:
+
         return RiskTier.MEDIUM
 
     return RiskTier.LOW
 
 
 def _load_merged_customer_df() -> pd.DataFrame:
-    """
-    Load customer risk scores and merge them
-    with customer features.
-    """
 
     if not RISK_SCORES_CSV.exists():
+
         raise HTTPException(
             status_code=503,
             detail=(
-                "customer_risk_scores.csv not found at "
+                "customer_risk_scores.csv "
+                "not found at "
                 f"{RISK_SCORES_CSV}. "
-                "Run your training/scoring pipeline first."
+                "Run your training/scoring "
+                "pipeline first."
             ),
         )
 
@@ -219,6 +274,7 @@ def _load_merged_customer_df() -> pd.DataFrame:
         )
 
     else:
+
         merged = risk_df
 
     return merged
@@ -227,21 +283,23 @@ def _load_merged_customer_df() -> pd.DataFrame:
 def _row_to_customer_risk_score(
     row: dict,
 ) -> CustomerRiskScore:
-    """
-    Convert a dataframe row into CustomerRiskScore.
-    """
 
     customer_id = str(
-        row.get("CustomerID") or ""
+        row.get("CustomerID")
+        or ""
     )
 
     churn_prob = float(
         _clean_nan(
-            row.get("churn_probability")
-        ) or 0.0
+            row.get(
+                "churn_probability"
+            )
+        )
+        or 0.0
     )
 
     return CustomerRiskScore(
+
         customer_id=customer_id,
 
         churn_probability=churn_prob,
@@ -252,15 +310,21 @@ def _row_to_customer_risk_score(
         ),
 
         monthly_charges=_clean_nan(
-            row.get("Monthly Charges")
+            row.get(
+                "Monthly Charges"
+            )
         ),
 
         tenure_months=_clean_nan(
-            row.get("Tenure Months")
+            row.get(
+                "Tenure Months"
+            )
         ),
 
         contract_type=_clean_nan(
-            row.get("Contract")
+            row.get(
+                "Contract"
+            )
         ),
 
         monthly_revenue_at_risk=_clean_nan(
@@ -283,29 +347,13 @@ def _row_to_customer_risk_score(
     )
 
 
+# ============================================================
+# OFFER PARSER
+# ============================================================
+
 def _parse_offer_recommendation(
     text: str,
 ) -> dict:
-    """
-    Parse structured Gemini output.
-
-    Expected format:
-
-        Recommended Offer:
-        ...
-
-        Why this offer:
-        ...
-
-        Policy Basis:
-        ...
-
-        Customer Message:
-        ...
-
-    Falls back gracefully if the LLM
-    does not follow the exact format.
-    """
 
     pattern = re.compile(
         r"Recommended Offer:\s*"
@@ -381,28 +429,27 @@ def _parse_offer_recommendation(
     }
 
 
+# ============================================================
+# CUSTOMER FILTER
+# ============================================================
+
 def _filter_customer_dataframe(
     df: pd.DataFrame,
     risk_tier: Optional[RiskTier] = None,
     contract_type: Optional[str] = None,
     search: Optional[str] = None,
 ) -> pd.DataFrame:
-    """
-    Apply customer filters.
 
-    Used by both:
-        GET /customers
-        GET /customers/export
-    """
-
-    # ------------------------------------------------------------
-    # Customer ID search
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # Search
+    # --------------------------------------------------------
 
     if search:
 
         search_value = (
-            search.strip().lower()
+            search
+            .strip()
+            .lower()
         )
 
         if search_value:
@@ -418,9 +465,9 @@ def _filter_customer_dataframe(
                 )
             ]
 
-    # ------------------------------------------------------------
-    # Contract type
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # Contract
+    # --------------------------------------------------------
 
     if contract_type:
 
@@ -430,23 +477,24 @@ def _filter_customer_dataframe(
             .lower()
         )
 
-        if contract_value:
+        if (
+            contract_value
+            and "Contract" in df.columns
+        ):
 
-            if "Contract" in df.columns:
+            df = df[
+                df["Contract"]
+                .astype(str)
+                .str.strip()
+                .str.lower()
+                .eq(
+                    contract_value
+                )
+            ]
 
-                df = df[
-                    df["Contract"]
-                    .astype(str)
-                    .str.strip()
-                    .str.lower()
-                    .eq(
-                        contract_value
-                    )
-                ]
-
-    # ------------------------------------------------------------
-    # Risk tier
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    # Risk
+    # --------------------------------------------------------
 
     if risk_tier is not None:
 
@@ -461,14 +509,17 @@ def _filter_customer_dataframe(
                     row.get(
                         "churn_probability"
                     )
-                ) or 0.0
+                )
+                or 0.0
             )
 
-            tier = _risk_tier_from_string(
-                row.get(
-                    "risk_tier"
-                ),
-                churn_prob,
+            tier = (
+                _risk_tier_from_string(
+                    row.get(
+                        "risk_tier"
+                    ),
+                    churn_prob,
+                )
             )
 
             calculated_tiers.append(
@@ -489,16 +540,16 @@ def _filter_customer_dataframe(
     return df
 
 
-# ============================================================================
-# CUSTOMER RECOMMENDATION STORE
-# ============================================================================
+# ============================================================
+# RECOMMENDATION STORE
+# ============================================================
 
 _RECS_STORE: dict = {}
 
 
-# ============================================================================
+# ============================================================
 # CUSTOMERS
-# ============================================================================
+# ============================================================
 
 @app.get(
     "/customers",
@@ -507,6 +558,7 @@ _RECS_STORE: dict = {}
     ],
 )
 def list_customers(
+
     page: int = Query(
         1,
         ge=1,
@@ -524,14 +576,6 @@ def list_customers(
 
     search: Optional[str] = None,
 ):
-    """
-    Get customers with:
-
-    - Customer ID search
-    - Risk tier filtering
-    - Contract type filtering
-    - Pagination
-    """
 
     df = _load_merged_customer_df()
 
@@ -563,6 +607,7 @@ def list_customers(
     )
 
     return PaginatedResponse(
+
         items=scores[
             start:end
         ],
@@ -575,26 +620,21 @@ def list_customers(
     )
 
 
-# ============================================================================
-# EXPORT FILTERED CUSTOMERS AS CSV
-# ============================================================================
+# ============================================================
+# EXPORT
+# ============================================================
 
 @app.get(
     "/customers/export"
 )
 def export_customers_csv(
+
     risk_tier: Optional[RiskTier] = None,
+
     contract_type: Optional[str] = None,
+
     search: Optional[str] = None,
 ):
-    """
-    Export filtered customers as CSV.
-
-    Filters supported:
-        - search
-        - risk_tier
-        - contract_type
-    """
 
     df = _load_merged_customer_df()
 
@@ -608,9 +648,12 @@ def export_customers_csv(
     if df.empty:
 
         csv_data = (
-            "CustomerID,churn_probability,"
-            "risk_tier,Monthly Charges,"
-            "Tenure Months,Contract,"
+            "CustomerID,"
+            "churn_probability,"
+            "risk_tier,"
+            "Monthly Charges,"
+            "Tenure Months,"
+            "Contract,"
             "monthly_revenue_at_risk,"
             "annual_revenue_at_risk,"
             "priority_score\n"
@@ -629,7 +672,8 @@ def export_customers_csv(
                     row.get(
                         "churn_probability"
                     )
-                ) or 0.0
+                )
+                or 0.0
             )
 
             risk_tier_value = (
@@ -641,53 +685,61 @@ def export_customers_csv(
                 ).value
             )
 
-            export_rows.append(
-                {
-                    "CustomerID": row.get(
+            export_rows.append({
+
+                "CustomerID":
+                    row.get(
                         "CustomerID"
                     ),
 
-                    "churn_probability": churn_probability,
+                "churn_probability":
+                    churn_probability,
 
-                    "risk_tier": risk_tier_value,
+                "risk_tier":
+                    risk_tier_value,
 
-                    "Monthly Charges": _clean_nan(
+                "Monthly Charges":
+                    _clean_nan(
                         row.get(
                             "Monthly Charges"
                         )
                     ),
 
-                    "Tenure Months": _clean_nan(
+                "Tenure Months":
+                    _clean_nan(
                         row.get(
                             "Tenure Months"
                         )
                     ),
 
-                    "Contract": _clean_nan(
+                "Contract":
+                    _clean_nan(
                         row.get(
                             "Contract"
                         )
                     ),
 
-                    "monthly_revenue_at_risk": _clean_nan(
+                "monthly_revenue_at_risk":
+                    _clean_nan(
                         row.get(
                             "monthly_revenue_at_risk"
                         )
                     ),
 
-                    "annual_revenue_at_risk": _clean_nan(
+                "annual_revenue_at_risk":
+                    _clean_nan(
                         row.get(
                             "annual_revenue_at_risk"
                         )
                     ),
 
-                    "priority_score": _clean_nan(
+                "priority_score":
+                    _clean_nan(
                         row.get(
                             "priority_score"
                         )
                     ),
-                }
-            )
+            })
 
         export_df = pd.DataFrame(
             export_rows
@@ -698,40 +750,44 @@ def export_customers_csv(
         )
 
     def csv_generator():
+
         yield csv_data
 
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d"
+    timestamp = (
+        datetime.now()
+        .strftime("%Y-%m-%d")
     )
 
     return StreamingResponse(
+
         csv_generator(),
+
         media_type="text/csv",
+
         headers={
-            "Content-Disposition": (
-                "attachment; "
-                f'filename="filtered-customers-{timestamp}.csv"'
-            )
+            "Content-Disposition":
+                (
+                    "attachment; "
+                    f'filename="filtered-customers-{timestamp}.csv"'
+                )
         },
     )
 
 
-# ============================================================================
-# CONTRACT TYPE OPTIONS
-# ============================================================================
+# ============================================================
+# CONTRACT TYPES
+# ============================================================
 
 @app.get(
     "/customers/meta/contract-types",
     response_model=List[str],
 )
 def get_contract_types():
-    """
-    Return all unique contract types.
-    """
 
     df = _load_merged_customer_df()
 
     if "Contract" not in df.columns:
+
         return []
 
     contract_types = (
@@ -741,20 +797,17 @@ def get_contract_types():
         .str.strip()
     )
 
-    contract_types = sorted(
-        [
-            contract
-            for contract in contract_types.unique()
-            if contract
-        ]
-    )
-
-    return contract_types
+    return sorted([
+        contract
+        for contract
+        in contract_types.unique()
+        if contract
+    ])
 
 
-# ============================================================================
+# ============================================================
 # CUSTOMER PROFILE
-# ============================================================================
+# ============================================================
 
 @app.get(
     "/customers/{customer_id}",
@@ -789,13 +842,13 @@ def get_customer_profile(
         .to_dict()
     )
 
-    base = _row_to_customer_risk_score(
-        row
+    base = (
+        _row_to_customer_risk_score(
+            row
+        )
     )
 
-    top_shap_features: List[
-        ShapFeatureContribution
-    ] = []
+    top_shap_features = []
 
     def _bool(value):
 
@@ -814,18 +867,25 @@ def get_customer_profile(
         )
 
     return CustomerProfile(
+
         **base.model_dump(),
 
         gender=_clean_nan(
-            row.get("Gender")
+            row.get(
+                "Gender"
+            )
         ),
 
         partner=_bool(
-            row.get("Partner")
+            row.get(
+                "Partner"
+            )
         ),
 
         dependents=_bool(
-            row.get("Dependents")
+            row.get(
+                "Dependents"
+            )
         ),
 
         internet_service=_clean_nan(
@@ -840,13 +900,14 @@ def get_customer_profile(
             )
         ),
 
-        top_shap_features=top_shap_features,
+        top_shap_features=
+            top_shap_features,
     )
 
 
-# ============================================================================
+# ============================================================
 # DASHBOARD SUMMARY
-# ============================================================================
+# ============================================================
 
 @app.get(
     "/dashboard/summary",
@@ -910,15 +971,17 @@ def get_dashboard_summary():
             4,
         ),
 
-        total_monthly_revenue_at_risk=round(
-            total_monthly,
-            2,
-        ),
+        total_monthly_revenue_at_risk=
+            round(
+                total_monthly,
+                2,
+            ),
 
-        total_annual_revenue_at_risk=round(
-            total_annual,
-            2,
-        ),
+        total_annual_revenue_at_risk=
+            round(
+                total_annual,
+                2,
+            ),
 
         risk_breakdown=[
             RiskTierBreakdown(
@@ -932,23 +995,15 @@ def get_dashboard_summary():
     )
 
 
-# ============================================================================
+# ============================================================
 # OFFERS TREND
-# ============================================================================
+# ============================================================
 
 @app.get(
     "/dashboard/offers-trend",
     response_model=OffersTrend,
 )
 def get_offers_trend():
-    """
-    Bucket recommendations by creation date.
-
-    Counts:
-        generated
-        accepted
-        dismissed
-    """
 
     buckets = defaultdict(
         lambda: {
@@ -1005,9 +1060,9 @@ def get_offers_trend():
     )
 
 
-# ============================================================================
+# ============================================================
 # RECOMMENDATIONS
-# ============================================================================
+# ============================================================
 
 @app.get(
     "/recommendations",
@@ -1057,6 +1112,7 @@ def list_recommendations(
     )
 
     return PaginatedResponse(
+
         items=items[
             start:end
         ],
@@ -1074,8 +1130,11 @@ def list_recommendations(
     response_model=Recommendation,
 )
 def act_on_recommendation(
+
     recommendation_id: str,
-    action: RecommendationActionRequest,
+
+    action:
+        RecommendationActionRequest,
 ):
 
     rec = _RECS_STORE.get(
@@ -1102,9 +1161,9 @@ def act_on_recommendation(
     return rec
 
 
-# ============================================================================
+# ============================================================
 # MODEL METRICS
-# ============================================================================
+# ============================================================
 
 @app.get(
     "/models/metrics",
@@ -1127,6 +1186,7 @@ def get_model_metrics():
         with open(
             XGBOOST_METRICS_JSON,
             "r",
+            encoding="utf-8",
         ) as f:
 
             raw = json.load(f)
@@ -1178,27 +1238,31 @@ def get_model_metrics():
             "threshold"
         ),
 
-        n_train_samples=raw.get(
-            "n_train_samples"
-        ),
+        n_train_samples=
+            raw.get(
+                "n_train_samples"
+            ),
 
-        n_test_samples=raw.get(
-            "n_test_samples"
-        ),
+        n_test_samples=
+            raw.get(
+                "n_test_samples"
+            ),
 
-        n_features=raw.get(
-            "n_features"
-        ),
+        n_features=
+            raw.get(
+                "n_features"
+            ),
 
-        trained_at=raw.get(
-            "trained_at"
-        ),
+        trained_at=
+            raw.get(
+                "trained_at"
+            ),
     )
 
 
-# ============================================================================
-# SHAP GLOBAL IMPORTANCE
-# ============================================================================
+# ============================================================
+# SHAP
+# ============================================================
 
 @app.get(
     "/models/shap/global",
@@ -1207,21 +1271,6 @@ def get_model_metrics():
     ],
 )
 def get_shap_global_importance():
-    """
-    Return global SHAP feature importance.
-
-    Supported CSV formats:
-
-        feature,mean_abs_shap
-
-    or:
-
-        feature,importance
-
-    or:
-
-        feature,mean_abs_shap_value
-    """
 
     if not SHAP_GLOBAL_CSV.exists():
 
@@ -1242,23 +1291,15 @@ def get_shap_global_importance():
         if df.empty:
             return []
 
-        # ------------------------------------------------------------
-        # Feature column
-        # ------------------------------------------------------------
-
         if "feature" not in df.columns:
 
             raise HTTPException(
                 status_code=500,
                 detail=(
                     "SHAP CSV must contain "
-                    "a 'feature' column."
+                    "'feature'."
                 ),
             )
-
-        # ------------------------------------------------------------
-        # Find SHAP importance column
-        # ------------------------------------------------------------
 
         shap_column = None
 
@@ -1282,16 +1323,9 @@ def get_shap_global_importance():
                 status_code=500,
                 detail=(
                     "SHAP CSV must contain "
-                    "one of: "
-                    "mean_abs_shap, "
-                    "importance, "
-                    "mean_abs_shap_value."
+                    "a SHAP importance column."
                 ),
             )
-
-        # ------------------------------------------------------------
-        # Clean data
-        # ------------------------------------------------------------
 
         df["feature"] = (
             df["feature"]
@@ -1311,18 +1345,10 @@ def get_shap_global_importance():
             ]
         )
 
-        # ------------------------------------------------------------
-        # Sort highest importance first
-        # ------------------------------------------------------------
-
         df = df.sort_values(
             by=shap_column,
             ascending=False,
         )
-
-        # ------------------------------------------------------------
-        # Build response
-        # ------------------------------------------------------------
 
         result = []
 
@@ -1330,16 +1356,16 @@ def get_shap_global_importance():
             orient="records"
         ):
 
-            value = float(
-                row[shap_column]
-            )
-
             result.append(
                 ShapGlobalImportanceItem(
+
                     feature=str(
                         row["feature"]
                     ),
-                    mean_abs_shap=value,
+
+                    mean_abs_shap=float(
+                        row[shap_column]
+                    ),
                 )
             )
 
@@ -1354,15 +1380,15 @@ def get_shap_global_importance():
             status_code=500,
             detail=(
                 "Failed to load SHAP "
-                "global importance: "
+                f"global importance: "
                 f"{str(exc)}"
             ),
         )
 
 
-# ============================================================================
-# SERVER SENT EVENTS
-# ============================================================================
+# ============================================================
+# SSE
+# ============================================================
 
 def _sse(event: dict) -> str:
 
@@ -1373,9 +1399,9 @@ def _sse(event: dict) -> str:
     )
 
 
-# ============================================================================
+# ============================================================
 # AI RETENTION ASSISTANT
-# ============================================================================
+# ============================================================
 
 @app.post(
     "/assistant/chat"
@@ -1386,9 +1412,9 @@ def chat_with_assistant(
 
     def event_generator():
 
-        # ================================================================
+        # ----------------------------------------------------
         # NO CUSTOMER ID
-        # ================================================================
+        # ----------------------------------------------------
 
         if not request.customer_id:
 
@@ -1405,13 +1431,16 @@ def chat_with_assistant(
                 "",
             )
 
-            yield _sse(
-                {
-                    "role": "assistant",
+            yield _sse({
 
-                    "node": "orchestrator",
+                "role":
+                    "assistant",
 
-                    "content": (
+                "node":
+                    "orchestrator",
+
+                "content":
+                    (
                         f"You said: "
                         f"{last_user_msg!r}. "
                         "Please mention a "
@@ -1419,8 +1448,7 @@ def chat_with_assistant(
                         "generate a "
                         "retention offer."
                     ),
-                }
-            )
+            })
 
             yield (
                 "data: [DONE]\n\n"
@@ -1428,11 +1456,13 @@ def chat_with_assistant(
 
             return
 
-        # ================================================================
+        # ----------------------------------------------------
         # LOAD CUSTOMER
-        # ================================================================
+        # ----------------------------------------------------
 
-        df = _load_merged_customer_df()
+        df = (
+            _load_merged_customer_df()
+        )
 
         match = df[
             df["CustomerID"]
@@ -1442,20 +1472,22 @@ def chat_with_assistant(
 
         if match.empty:
 
-            yield _sse(
-                {
-                    "role": "assistant",
+            yield _sse({
 
-                    "node": "orchestrator",
+                "role":
+                    "assistant",
 
-                    "content": (
+                "node":
+                    "orchestrator",
+
+                "content":
+                    (
                         f"I couldn't find "
                         f"customer "
                         f"{request.customer_id!r} "
                         "in the system."
                     ),
-                }
-            )
+            })
 
             yield (
                 "data: [DONE]\n\n"
@@ -1463,9 +1495,9 @@ def chat_with_assistant(
 
             return
 
-        # ================================================================
+        # ----------------------------------------------------
         # CUSTOMER SCORE
-        # ================================================================
+        # ----------------------------------------------------
 
         row = (
             match
@@ -1479,56 +1511,60 @@ def chat_with_assistant(
             )
         )
 
-        yield _sse(
-            {
-                "role": "assistant",
+        yield _sse({
 
-                "node": "diagnosis",
+            "role":
+                "assistant",
 
-                "content": (
+            "node":
+                "diagnosis",
+
+            "content":
+                (
                     "Analyzing churn risk "
                     f"for "
                     f"{score.customer_id}…"
                 ),
-            }
-        )
+        })
 
-        # ================================================================
+        # ----------------------------------------------------
         # GENERATE OFFER
-        #
-        # RAG + LLM/Gemini
-        # ================================================================
+        # ----------------------------------------------------
 
         try:
 
             offer_result = (
                 generate_retention_offer(
+
                     customer_data=row,
 
                     churn_probability=(
                         score.churn_probability
                     ),
 
-                    customer_segment="Standard",
+                    customer_segment=
+                        "Standard",
                 )
             )
 
         except Exception as exc:
 
-            yield _sse(
-                {
-                    "role": "assistant",
+            yield _sse({
 
-                    "node": "offer_strategist",
+                "role":
+                    "assistant",
 
-                    "content": (
+                "node":
+                    "offer_strategist",
+
+                "content":
+                    (
                         "I was unable to "
                         "generate the retention "
                         "offer right now. "
                         f"Error: {str(exc)}"
                     ),
-                }
-            )
+            })
 
             yield (
                 "data: [DONE]\n\n"
@@ -1536,9 +1572,9 @@ def chat_with_assistant(
 
             return
 
-        # ================================================================
-        # PARSE GENERATED OFFER
-        # ================================================================
+        # ----------------------------------------------------
+        # PARSE OFFER
+        # ----------------------------------------------------
 
         offer = (
             _parse_offer_recommendation(
@@ -1548,9 +1584,9 @@ def chat_with_assistant(
             )
         )
 
-        # ================================================================
+        # ----------------------------------------------------
         # SAVE RECOMMENDATION
-        # ================================================================
+        # ----------------------------------------------------
 
         rec_id = (
             f"rec-"
@@ -1601,9 +1637,9 @@ def chat_with_assistant(
             rec_id
         ] = recommendation
 
-        # ================================================================
-        # ASSISTANT RESPONSE
-        # ================================================================
+        # ----------------------------------------------------
+        # RESPONSE
+        # ----------------------------------------------------
 
         reply_text = (
             "I've generated a "
@@ -1614,27 +1650,94 @@ def chat_with_assistant(
             f"{offer_result['recommendation']}"
         )
 
-        yield _sse(
-            {
-                "role": "assistant",
+        yield _sse({
 
-                "node": "offer_strategist",
+            "role":
+                "assistant",
 
-                "content": reply_text,
-            }
-        )
+            "node":
+                "offer_strategist",
 
-        # ================================================================
-        # STREAM END
-        # ================================================================
+            "content":
+                reply_text,
+        })
 
         yield (
             "data: [DONE]\n\n"
         )
 
     return StreamingResponse(
+
         event_generator(),
-        media_type=(
-            "text/event-stream"
-        ),
+
+        media_type=
+            "text/event-stream",
     )
+
+
+# ============================================================
+# COMPLAINTS
+# ============================================================
+
+@app.get(
+    "/complaints"
+)
+def get_complaints():
+
+    complaints = (
+        _load_json_store(
+            COMPLAINTS_PATH
+        )
+    )
+
+    return list(
+        complaints.values()
+    )
+
+
+# ============================================================
+# CUSTOMER-SPECIFIC COMPLAINTS
+# ============================================================
+
+@app.get(
+    "/complaints/{customer_id}"
+)
+def get_customer_complaints(
+    customer_id: str,
+):
+
+    complaints = (
+        _load_json_store(
+            COMPLAINTS_PATH
+        )
+    )
+
+    customer_complaints = [
+
+        complaint
+
+        for complaint
+        in complaints.values()
+
+        if str(
+            complaint.get(
+                "customer_id"
+            )
+        ).strip().upper()
+        ==
+        customer_id.strip().upper()
+    ]
+
+    return {
+
+        "customer_id":
+            customer_id,
+
+        "total":
+            len(
+                customer_complaints
+            ),
+
+        "complaints":
+            customer_complaints,
+    }
