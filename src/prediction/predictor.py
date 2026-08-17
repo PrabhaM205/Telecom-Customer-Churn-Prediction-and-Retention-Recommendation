@@ -23,6 +23,9 @@ from src.explainability.shap import (
 )
 from agent.graph import build_retention_agent
 from agent.state import RetentionAgentState
+from src.config import get as config_get
+
+_MAX_RETRIES = config_get("agent", "max_retries", default=2)
 
 
 # --------------------------------------------------
@@ -84,15 +87,27 @@ def predict_customer(customer_row: dict, run_agent: bool = True) -> dict:
     explanation["retention_strategy"] = suggest_retention_strategy(explanation["top_risk_drivers"])
 
     result = {
+        # Customer profile
         "customer_id": risk_result["CustomerID"],
+        "customer_profile": customer_row,
+        # Risk
         "churn_probability": risk_result["churn_probability"],
         "risk_tier": risk_result["risk_tier"],
         "monthly_revenue_at_risk": risk_result["monthly_revenue_at_risk"],
         "annual_revenue_at_risk": risk_result["annual_revenue_at_risk"],
         "priority_score": risk_result["priority_score"],
+        # SHAP
         "top_risk_drivers": explanation["top_risk_drivers"],
         "top_retention_drivers": explanation["top_retention_drivers"],
         "retention_strategy": explanation["retention_strategy"],
+        # Agent workflow outputs (filled below if run_agent)
+        "diagnosis": None,
+        "candidate_offer": None,
+        "guardrail_result": None,
+        "retry_count": 0,
+        "escalated": None,
+        "final_offer": None,
+        # Backward-compatible aliases
         "offer": None,
         "agent_approved": None,
         "agent_escalated": None,
@@ -102,27 +117,39 @@ def predict_customer(customer_row: dict, run_agent: bool = True) -> dict:
         return result
 
     # ---- 3. Agent workflow: Diagnosis -> Offer-Strategist -> Guardrail -> Orchestrator ----
+    segment = _infer_segment(risk_result["annual_revenue_at_risk"])
     initial_state: RetentionAgentState = {
         "customer_data": customer_row,
         "churn_probability": risk_result["churn_probability"],
         "revenue_at_risk": risk_result["annual_revenue_at_risk"],
-        "customer_segment": _infer_segment(risk_result["annual_revenue_at_risk"]),
-        "eligibility": None,
-        "offer_result": None,
-        "approved": None,
-        "rejection_reason": None,
+        "customer_segment": segment,
+        "shap_drivers": explanation["top_risk_drivers"],
+        "diagnosis": None,
+        "candidate_offer": None,
+        "guardrail_result": None,
+        "guardrail_feedback": None,
         "retry_count": 0,
+        "max_retries": _MAX_RETRIES,
         "escalated": False,
+        "final_offer": None,
     }
 
     final_state = agent_app.invoke(initial_state)
 
-    result["agent_approved"] = final_state["approved"]
+    result["diagnosis"] = final_state["diagnosis"]
+    result["candidate_offer"] = final_state["candidate_offer"]
+    result["guardrail_result"] = final_state["guardrail_result"]
+    result["retry_count"] = final_state["retry_count"]
+    result["escalated"] = final_state["escalated"]
+    result["final_offer"] = final_state["final_offer"]
+
+    # Backward-compatible aliases (older UI/tests may still read these)
+    result["agent_approved"] = final_state["guardrail_result"]["status"] == "APPROVED"
     result["agent_escalated"] = final_state["escalated"]
-    if final_state["approved"]:
-        result["offer"] = final_state["offer_result"]["recommendation"]
+    if final_state["final_offer"]:
+        result["offer"] = final_state["final_offer"]
     elif final_state["escalated"]:
-        result["escalation_reason"] = final_state["rejection_reason"]
+        result["escalation_reason"] = final_state["guardrail_feedback"]
 
     return result
 

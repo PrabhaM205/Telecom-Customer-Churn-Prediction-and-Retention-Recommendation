@@ -6,19 +6,24 @@ from agent.nodes import (
     offer_strategist_node,
     guardrail_node,
     orchestrator_node,
+    route_after_orchestrator,
     MAX_RETRIES,
 )
 
 
-def route_after_orchestrator(state: RetentionAgentState) -> str:
-    if state["approved"]:
-        return "end"
-    if state["escalated"]:
-        return "end"
-    return "retry"  # loop back to Offer-Strategist
-
-
 def build_retention_agent():
+    """
+    4-agent retention workflow:
+
+        Diagnosis -> Offer-Strategist -> Guardrail -> Orchestrator
+                          ^                                |
+                          |________________ retry __________|
+                                    (REJECTED, under max_retries)
+
+    Orchestrator ends the graph on APPROVED or ESCALATE. retry_count is
+    monotonically incremented in orchestrator_node and bounded by
+    max_retries, so the retry loop always terminates.
+    """
     workflow = StateGraph(RetentionAgentState)
 
     workflow.add_node("diagnosis", diagnosis_node)
@@ -51,15 +56,22 @@ if __name__ == "__main__":
             "Contract": "Month-to-month",
             "Payment Method": "Electronic check",
         },
-        "churn_probability": 0.15,
+        "churn_probability": 0.82,
         "revenue_at_risk": 300.00,
         "customer_segment": "Standard",
-        "eligibility": None,
-        "offer_result": None,
-        "approved": None,
-        "rejection_reason": None,
+        "shap_drivers": [
+            {"feature": "Contract_Month-to-month", "shap_value": 0.9},
+            {"feature": "Tech Support_No", "shap_value": 0.6},
+            {"feature": "Payment Method_Electronic check", "shap_value": 0.4},
+        ],
+        "diagnosis": None,
+        "candidate_offer": None,
+        "guardrail_result": None,
+        "guardrail_feedback": None,
         "retry_count": 0,
+        "max_retries": MAX_RETRIES,
         "escalated": False,
+        "final_offer": None,
     }
 
     final_state = app.invoke(initial_state)
@@ -67,9 +79,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print("AGENT WORKFLOW RESULT")
     print("=" * 60)
-    print(f"Approved   : {final_state['approved']}")
-    print(f"Escalated  : {final_state['escalated']}")
-    if final_state["approved"]:
-        print("\nFinal Offer:\n", final_state["offer_result"]["recommendation"])
+    print(f"Guardrail Status : {final_state['guardrail_result']['status']}")
+    print(f"Escalated        : {final_state['escalated']}")
+    print(f"Retry Count      : {final_state['retry_count']}")
+    if final_state["final_offer"]:
+        print("\nFinal Offer:\n", final_state["final_offer"])
     elif final_state["escalated"]:
-        print(f"\nEscalated after {final_state['retry_count']} attempts: {final_state['rejection_reason']}")
+        print(f"\nEscalated: {final_state['guardrail_feedback']}")

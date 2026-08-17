@@ -3,9 +3,14 @@ import os
 import pickle
 import faiss
 
-from document_loader import load_policy_document
-from chunker import chunk_documents
-from embeddings import PolicyEmbedder
+try:
+    from .document_loader import load_policy_document
+    from .chunker import chunk_documents
+    from .embeddings import PolicyEmbedder
+except ImportError:  # allows `python genai/rag/vector_store.py` direct script execution too
+    from document_loader import load_policy_document
+    from chunker import chunk_documents
+    from embeddings import PolicyEmbedder
 from src.config import get, resolve_path
 
 # --------------------------------------------------

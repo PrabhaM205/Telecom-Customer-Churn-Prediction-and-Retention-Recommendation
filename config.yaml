@@ -1,0 +1,43 @@
+# config.yaml
+# Non-secret configuration: thresholds, paths, model names.
+# API keys / secrets stay in .env — never here.
+
+agent:
+  max_retries: 2
+  top_n_shap_drivers: 5
+
+llm:
+  model_name: gemini-flash-latest
+
+rag:
+  pdf_path: data/raw/company_policy.pdf
+  vector_dir: data/processed/policy_vector_store
+  top_k: 3
+
+guardrail:
+  # Tenure-based discount / bill-credit ceilings.
+  # tenure is measured in months. Tiers are checked lowest-bound-first.
+  tenure_tiers:
+    - name: "0-6 months"
+      min_tenure_months: 0
+      max_tenure_months: 6
+      max_discount_percent: 5
+      max_bill_credit_months: 3
+    - name: "6-24 months"
+      min_tenure_months: 6
+      max_tenure_months: 24
+      max_discount_percent: 10
+      max_bill_credit_months: 6
+    - name: "2-5 years"
+      min_tenure_months: 24
+      max_tenure_months: 60
+      max_discount_percent: 15
+      max_bill_credit_months: 9
+    - name: "5+ years"
+      min_tenure_months: 60
+      max_tenure_months: null
+      max_discount_percent: 20
+      max_bill_credit_months: 12
+
+  max_incentive_types: 2
+  restricted_customer_segments: []

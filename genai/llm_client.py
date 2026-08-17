@@ -21,28 +21,36 @@ API_KEY = os.getenv(
 )
 
 
-if not API_KEY:
-
-    raise ValueError(
-        "GEMINI_API_KEY not found. "
-        "Add it to the .env file."
-    )
-
-
 # ============================================================
 # GEMINI CLIENT
 # ============================================================
+# Lazily constructed -- do NOT raise at import time. A missing API key (or
+# any client construction error) is instead surfaced as a "Gemini API
+# Error: ..." string from generate_response(), same as any other runtime
+# failure, so callers (genai/offer_generator.py) can catch it and fall back
+# to the deterministic offer engine instead of the whole process crashing
+# on import. This also lets tests import this module and mock
+# generate_response() without needing a real API key.
 
-client = genai.Client(
-    api_key=API_KEY
-)
+_client = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        if not API_KEY:
+            raise ValueError(
+                "GEMINI_API_KEY not found. Add it to the .env file."
+            )
+        _client = genai.Client(api_key=API_KEY)
+    return _client
 
 
 # ============================================================
 # GEMINI FLASH MODEL
 # ============================================================
 
-MODEL_NAME = get("llm", "model_name", default="gemini-3.6-flash")
+MODEL_NAME = get("llm", "model_name", default="gemini-2.0-flash")
 
 
 # ============================================================
@@ -52,6 +60,7 @@ MODEL_NAME = get("llm", "model_name", default="gemini-3.6-flash")
 def generate_response(prompt):
 
     try:
+        client = _get_client()
 
         response = client.models.generate_content(
             model=MODEL_NAME,

@@ -35,6 +35,110 @@ from genai.rag.retriever import PolicyRetriever
 
 from genai.llm_client import generate_response
 
+from src.recommendation.retention_rules import get_tenure_tier, _extract_tenure_months
+
+
+# ============================================================
+# DETERMINISTIC FALLBACK OFFER (no LLM, no RAG)
+# ============================================================
+#
+# Used by genai/offer_generator.py's Offer-Strategist Agent whenever the
+# Gemini call fails, the API key is missing, the LLM response is malformed
+# (parse_offer_response() raises), or RAG/LLM generation otherwise fails.
+# Guarantees the system never crashes and never lets invalid LLM output
+# reach the customer -- this deterministic offer is always well-formed and
+# always compliant with the tenure-tier caps in config.yaml, so it should
+# pass the Guardrail Agent on the first attempt.
+
+_FALLBACK_OFFER_TYPE_BY_DRIVER = {
+    "Contract_Month-to-month": "contract_discount",
+    "Tech Support_No": "service_addon_trial",
+    "Online Security_No": "service_addon_trial",
+    "Payment Method_Electronic check": "bill_credit",
+    "Monthly Charges": "bill_credit",
+}
+
+_DEFAULT_FALLBACK_OFFER_TYPE = "bill_credit"
+
+
+def _pick_fallback_offer_type(diagnosis: dict, previous_offer: dict = None) -> str:
+    risk_drivers = (diagnosis or {}).get("risk_drivers", [])
+    previous_type = (previous_offer or {}).get("offer_type")
+    for driver in risk_drivers:
+        candidate = _FALLBACK_OFFER_TYPE_BY_DRIVER.get(driver.get("feature"))
+        if candidate and candidate != previous_type:
+            return candidate
+    # Nothing matched (or it would repeat the rejected offer) -- deterministic
+    # generic fallback, distinct from whatever was previously rejected.
+    return "service_addon_trial" if previous_type == _DEFAULT_FALLBACK_OFFER_TYPE else _DEFAULT_FALLBACK_OFFER_TYPE
+
+
+def generate_fallback_offer(
+    customer_data: dict,
+    diagnosis: dict,
+    churn_probability: float,
+    customer_segment: str = "Standard",
+    previous_offer: dict = None,
+) -> dict:
+    """
+    Builds a safe, policy-compliant structured offer WITHOUT calling any
+    LLM or RAG retrieval -- deterministic, tenure-tier-capped, and always
+    well-formed (matches the same schema as the Offer-Strategist Agent's
+    LLM-generated offers). Intentionally conservative (uses roughly half of
+    the tenure tier's max cap) so it should clear the Guardrail Agent.
+    """
+    tenure_months = _extract_tenure_months(customer_data)
+    tier = get_tenure_tier(tenure_months)
+
+    offer_type = _pick_fallback_offer_type(diagnosis, previous_offer)
+
+    # Conservative: half the tier max, at least 1.
+    safe_discount = max(1, tier["max_discount_percent"] // 2)
+    safe_duration = max(1, tier["max_bill_credit_months"] // 2)
+
+    driver_summary = (diagnosis or {}).get("summary", "elevated churn risk")
+
+    if offer_type == "contract_discount":
+        offer_text = (
+            f"A {safe_discount}% discount for switching to a longer-term contract, "
+            f"applied for {safe_duration} months."
+        )
+        discount_percent = safe_discount
+        duration_months = safe_duration
+        minimum_term_months = 12
+        incentive_types = ["discount"]
+    elif offer_type == "service_addon_trial":
+        offer_text = "A complimentary trial of the relevant support/security add-on to address the customer's gap in service."
+        discount_percent = 0
+        duration_months = safe_duration
+        minimum_term_months = 0
+        incentive_types = ["service_addon"]
+    else:  # bill_credit
+        offer_text = f"A bill credit of {safe_discount}% applied for {safe_duration} months."
+        discount_percent = safe_discount
+        duration_months = safe_duration
+        minimum_term_months = 0
+        incentive_types = ["bill_credit"]
+
+    return {
+        "offer_type": offer_type,
+        "offer_text": offer_text,
+        "reason": f"Deterministic fallback offer targeting: {driver_summary}",
+        "discount_percent": discount_percent,
+        "duration_months": duration_months,
+        "minimum_term_months": minimum_term_months,
+        "incentive_types": incentive_types,
+        "policy_basis": (
+            f"Deterministic fallback -- conservative half of the '{tier['name']}' tenure-tier "
+            f"auto-approval cap (max {tier['max_discount_percent']}% discount / "
+            f"{tier['max_bill_credit_months']} months bill credit)."
+        ),
+        "customer_message": (
+            "We value your loyalty and would like to offer you a special retention benefit "
+            "to help address your recent experience with us."
+        ),
+    }
+
 
 # ============================================================
 # LOAD CUSTOMER DATA
